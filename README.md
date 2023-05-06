@@ -1,11 +1,11 @@
-## AWS Account Cleanser framework using aws-nuke
+## AWS Spending Limits using aws-nuke
+
+**DRAFT**: This is a draft project. Use at your own risk.
 
 
-## AWS Nuke is an open source tool created by rebuy.de
-## https://github.com/rebuy-de/aws-nuke
-## AWS Nuke searches for deleteable resources in the provided AWS acccount and deletes those which are not considered "Default" or "AWS-Managed"
-## In short, it will take your account back to Day1 with few exceptions
-
+AWS Nuke is an open source tool created by rebuy.de https://github.com/rebuy-de/aws-nuke
+AWS Nuke searches for deleteable resources in the provided AWS acccount and deletes those which are not considered "Default" or "AWS-Managed"
+In short, it will take your account back to Day 1 with few exceptions
 
 ```sh
 $ First and Final Warning: This is a dangerous and very destructive tool and should not be deployed without fully understanding the impact it will have on the accounts you allow it to interface with.
@@ -27,12 +27,12 @@ $ First and Final Warning: This is a dangerous and very destructive tool and sho
     3. Generally the aws-nuke command line need to assume STS temporary credentials for handling the resources in each account using IAM Role-chaining which limits it's max time to 60 minutes most of the times and hence if multiple regions are configured to run in one CodeBuild project execution , there could be lot of stale resources still left out without being destroyed.
         - This pattern takes care of that by executing the clean up for each region in a single account in parallel using the Step Functions Map state.
         - This also uses the credentials for the aws-nuke binary configured with the profile, that can be configured with the shared aws config file ( ~/.aws/config) which doesn't expire with a 1 hour session limit.
-        - Also this increases the default CodeBuild project time out to about 2-4 hours , allowing more time for the nuke to complete deleting all resources for each reg   
+        - Also this increases the default CodeBuild project time out to about 2-4 hours , allowing more time for the nuke to complete deleting all resources for each reg
     4. The aws-nuke binary works based off the nuke-config.yaml file , which is dynamically updated in this pattern using a python filtering class , to provide flexibility in handling the resource filters and region constraints based on the supplied override parameters.
     5. This workflow invokes the CodeBuild project synchronously and waits for Success. It also has a retry mechanism to trigger the CodeBuild project again with a configured amount of time , if in case it errors out, making sure all the resources are handled in the daily run without any manual intervention.
     6. The workflow also sends out a detailed report to an SNS topic subscription on what resources were deleted after the job is successful for each region which simplifies traversing and parsing the complex logs written out by the aws-nuke binary.
 
-## Prerequisites 
+## Prerequisites
 
 1. https://github.com/rebuy-de/aws-nuke --> Open source library staged/downloaded to artifactory or S3. This aws-nuke binary is owned by rebuy-de
 
@@ -46,7 +46,7 @@ $ First and Final Warning: This is a dangerous and very destructive tool and sho
 
 6. AWS SNS Topic  -->  An active email address with SNS topic subscription to send the CodeBuild job status and the detailed report of resources nuked daily
 
-7. AWS EventBridge Rule --> Configured with the required cron schedule to trigger the workflow periodically. The input parameters to invoke the Rule target should be updated with the required region lists as needed
+7. AWS EventBridge Rule --> Configured with an event pattern that listens for SNS notifications triggered by exceeding a budget threshold. The input parameters to invoke the Rule target should be updated with the required region lists as needed.
 
 8. Make sure you have sufficient network connectivity from the VPC where this is run, as CodeBuild downloads the nuke binary from github. If running in restricted environment, have the binary uploaded to S3 bucket or artifactory and reference that.
 
@@ -54,7 +54,7 @@ $ First and Final Warning: This is a dangerous and very destructive tool and sho
 
 * CodeBuild provides a super-handy way for us to spin up a container and run a script without having to worry about provisioning and maintaining resources. We’re using CloudFormation to define the whole project, so the code sample below displays the bulk of the Project resource configuration for a CloudFormation template. In short, we’re building a standard AWS Linux Docker container, configuring the log output channel, assigning an AWS Role for the nuke binary to assume the account roles (mentioned earlier) to start the clean up based on the region and config file.
 
-* AWS EventBridge Events provides both event-based and scheduled triggers for automated actions in other services. This is basically a fancy Cron job to schedule the build project. As with the CodeBuild Project, the example below is a resource defined within a CloudFormation template. In short, it defines the schedule expression for the Cron job (3:00a EST Mon-Fri), a role to allow the event trigger to run and kick off the StepFunctions workflow as a target which will orchestrate the CodeBuild project invocation based on the supplied region list parameter and the dynamic nuke config file modified during runtime.
+* AWS EventBridge Events provides event-based triggers for automated actions in other services. In our case, it serves as a trigger for the Step Functions workflow when a budget notification is sent to an SNS topic. The example below is a resource defined within a CloudFormation template. In short, it defines an event pattern that listens for SNS notifications from the specified topic, which is triggered by exceeding a budget threshold. A role is also defined to allow the event trigger to run and kick off the Step Functions workflow, which will orchestrate the CodeBuild project invocation based on the supplied region list parameter and the dynamic nuke config file modified during runtime.
 
 * AWS StepFunctions provides this design with scalability and help achieve dynamic parallelism across accounts/regions using the Map State. The orchestration of this pattern using Step Functions serves the purpose of handling resources in each region using a separate invocation of CodeBuild Project ( the region attribute in the nuke config  file required by the aws-nuke binary is dynamically updated using a custom python class inside the CodeBuild project )  with the region parameter and the customized nuke config , thus providing dynamic parallelism with the Map state that fans out for all the regions as needed within the sandbox account and thus saves time and provide scalability to handle a lot of resources.
 
@@ -71,14 +71,15 @@ $ aws-nuke -c $line.yaml --force --no-dry-run --access-key-id $ACCESS_KEY_ID --s
 * Clone the repo
 * Determine the ID of the account to be deployed for clean up ( This is only to be deployed to Dev/Test/Sandbox environments )
 * Verify and Update your nuke configuration file as needed with specific filters for the resources/accounts
+* Create an aws budget called `nuke-budget` https://docs.aws.amazon.com/cli/latest/reference/budgets/create-budget.html
 * Deploy the stack using the below command. You can run it in any desired region.
 ```sh
-aws cloudformation create-stack --stack-name NukeCleanser --template-body file://nuke-cfn-stack.yaml --region us-east-2 --capabilities CAPABILITY_NAMED_IAM
+aws cloudformation create-stack --stack-name NukeCleanser --template-body file://nuke-cfn-stack.yaml --region $AWS_REGION --capabilities CAPABILITY_NAMED_IAM
 ```
 * Once the stack is created, upload the nuke generic config file and the python script to the S3 bucket using the commands below. You can find the name of the S3 bucket generated from the CloudFormation console `Outputs` tab.
 ```sh
-aws s3 cp config/nuke_generic_config.yaml --region us-east-2 s3://{your-bucket-name}
-aws s3 cp config/nuke_config_update.py --region us-east-2 s3://{your-bucket-name}
+aws s3 cp config/nuke_generic_config.yaml --region $AWS_REGION s3://{your-bucket-name}
+aws s3 cp config/nuke_config_update.py --region $AWS_REGION s3://{your-bucket-name}
 ```
 * Run the stack manually by triggering the StepFunctions with the below sample input payload. (which is pre-configured in the EventBridge Target as a Constant JSON input). You can configure this to run in parallel on the required number of regions by updating the region_list parameter.
 
@@ -98,10 +99,10 @@ aws s3 cp config/nuke_config_update.py --region us-east-2 s3://{your-bucket-name
 
 * The tool is currently configured to run at a schedule as desired typically off hours 3:00a EST. It can be easily configured with a rate() or cron() expression by editing the cfn template file
 
-* The workflow also sends out a detailed report to an SNS topic with an active email subscription on what resources were deleted after the job is successful for each region which simplifies traversing and parsing the complex logs spit out by the aws-nuke binary. 
+* The workflow also sends out a detailed report to an SNS topic with an active email subscription on what resources were deleted after the job is successful for each region which simplifies traversing and parsing the complex logs spit out by the aws-nuke binary.
 
 * If the workflow is successful , the stack will send out
-  - One email for each of the regions where nuke CodeBuild job was invoked with details of the build execution , the list of resources which was deleted along with the log file path. 
+  - One email for each of the regions where nuke CodeBuild job was invoked with details of the build execution , the list of resources which was deleted along with the log file path.
   - The StepFunctions workflow also sends out another email when the whole Map state process completes successfully. Sample email template given below.
 
 ```sh
@@ -162,7 +163,7 @@ awslogs get AccountNuker-nuke-auto-account-cleanser --filter-pattern '"AccessDen
 
 ```sh
 fields @timestamp, @message
-| filter userIdentity.sessionContext.sessionIssuer.userName = "nuke-auto-account-cleanser" and ispresent(errorCode) 
+| filter userIdentity.sessionContext.sessionIssuer.userName = "nuke-auto-account-cleanser" and ispresent(errorCode)
 | sort @timestamp desc
 | limit 500
 

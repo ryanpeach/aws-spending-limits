@@ -14,6 +14,10 @@ Parameters:
   BudgetName:
     Description: The name of the budget to be used for the overage.
     Type: String
+  RegionList:
+    Type: CommaDelimitedList
+    Default: us-west-1,us-east-1
+    Description: A comma-separated list of AWS regions to run the nuke process in
   NukeCleanserRoleName:
     Description: The name of the Nuke Role to be assumed within each account, providing permissions to cleanse the account(s)
     Type: String
@@ -52,7 +56,6 @@ Resources:
               - access-analyzer:*
               - autoscaling:*
               - aws-portal:*
-              - budgets:*
               - cloudtrail:*
               - cloudwatch:*
               - config:*
@@ -93,6 +96,7 @@ Resources:
       Description: Managed policy for nuke account cleansing
       Path:
         Ref: IAMPath
+
   NukeAccountCleanserRole:
     Type: AWS::IAM::Role
     Properties:
@@ -119,27 +123,68 @@ Resources:
       Path:
         Ref: IAMPath
 
-  EventBridgeNukeScheduleRole:
+  BudgetNotificationSNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: BudgetNotificationSNSTopic
+      TopicName: budget-notification
+
+  BudgetNotification:
+    Type: AWS::Budgets::Notification
+    Properties:
+      AccountId: !Ref AWS::AccountId
+      BudgetName: !Ref BudgetName
+      Notification:
+        ComparisonOperator: GREATER_THAN
+        NotificationType: ACTUAL
+        Threshold: 100
+        ThresholdType: PERCENTAGE
+      Subscription:
+        SubscriptionType: SNS
+        Address: !Ref BudgetNotificationSNSTopic
+
+  BudgetNotificationEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: BudgetNotificationEventRule
+      Description: EventBridge rule to trigger CodeBuild when a budget notification is sent to SNS topic
+      EventPattern:
+        source:
+          - aws.sns
+        detail-type:
+          - AWS API Call via CloudTrail
+        detail:
+          eventName:
+            - Publish
+          requestParameters:
+            topicArn:
+              - !Ref BudgetNotificationSNSTopic
+      State: ENABLED
+      Targets:
+        - Id: BudgetNotificationCodeBuildTarget
+          Arn: !Ref ExistingCodeBuildProjectArn
+          RoleArn: !GetAtt EventBridgeRuleRole.Arn
+
+  EventBridgeRuleRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: !Sub EventBridgeNukeSchedule-${AWS::StackName}
       AssumeRolePolicyDocument:
-        Version: 2012-10-17
+        Version: '2012-10-17'
         Statement:
           - Effect: Allow
             Principal:
-              Service: events.amazonaws.com
-            Action: sts:AssumeRole
+              Service:
+                - events.amazonaws.com
+            Action:
+              - sts:AssumeRole
       Policies:
-        -
-         PolicyName: EventBridgeNukeStateMachineExecutionPolicy
-         PolicyDocument:
-           Version: 2012-10-17
-           Statement:
-              -
-                Effect: Allow
-                Action: states:StartExecution
-                Resource: !Ref NukeStepFunction
+        - PolicyName: EventBridgeCodeBuildExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: codebuild:StartBuild
+                Resource: !Ref NukeCodeBuildProject.Outputs.Arn
 
   NukeCodeBuildProjectRole:
     Type: AWS::IAM::Role
@@ -446,31 +491,63 @@ Resources:
 
         Type: NO_SOURCE
 
-  EventBridgeNukeSchedule:
+  EventBridgeNukeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub EventBridgeNuke-${AWS::StackName}
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        -
+         PolicyName: EventBridgeNukeStateMachineExecutionPolicy
+         PolicyDocument:
+           Version: 2012-10-17
+           Statement:
+              -
+                Effect: Allow
+                Action: states:StartExecution
+                Resource: !Ref NukeStepFunction
+
+
+  EventBridgeNuke:
     Type: AWS::Events::Rule
     Properties:
-      Name: !Sub EventBridgeNukeSchedule-${AWS::StackName}
-      Description: Scheduled Event for running AWS Nuke on the target accounts within the specified regions
-      ScheduleExpression: cron(0 7 ? * * *)
-      State:  ENABLED
-      RoleArn: !GetAtt EventBridgeNukeScheduleRole.Arn
+      Name: !Sub EventBridgeNuke-${AWS::StackName}
+      Description: EventBridge rule to trigger Step Function based on a budget notification
+      EventPattern:
+        detail-type:
+          - AWS API Call via CloudTrail
+        detail:
+          eventName:
+            - Publish
+          requestParameters:
+            topicArn:
+              - !Ref BudgetNotificationSNSTopic
+        source:
+          - aws.sns
+      State: ENABLED
+      RoleArn: !GetAtt EventBridgeNukeRole.Arn
       Targets:
-      -
-        Arn: !Ref NukeStepFunction
-        RoleArn: !GetAtt EventBridgeNukeScheduleRole.Arn
-        Id: !GetAtt NukeStepFunction.Name
-        Input:
-          !Sub |-
-            {
-              "InputPayLoad": {
-                "nuke_dry_run": "${AWSNukeDryRunFlag}",
-                "nuke_version": "${AWSNukeVersion}",
-                "region_list": [
-                  "us-west-1",
-                  "us-east-1"
-                ]
-              }
-            }
+        -
+          Arn: !Ref NukeStepFunction
+          RoleArn: !GetAtt EventBridgeNukeRole.Arn
+          Id: !GetAtt NukeStepFunction.Name
+          Input:
+            !Sub
+              - |-
+                {
+                  "InputPayLoad": {
+                    "nuke_dry_run": "${AWSNukeDryRunFlag}",
+                    "nuke_version": "${AWSNukeVersion}",
+                    "region_list": ${RegionList}
+                  }
+                }
+              - {RegionList: !Join [",", !Ref RegionList]}
 
   # S3 Bucket for storing nuke config yaml
   NukeS3Bucket:

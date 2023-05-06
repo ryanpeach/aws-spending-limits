@@ -1,7 +1,7 @@
 ---
 AWSTemplateFormatVersion: 2010-09-09
 Description: >
-  This CFN Template creates a StepFunction state machine definition , to invoke a CodeBuild Project and 
+  This CFN Template creates a StepFunction state machine definition , to invoke a CodeBuild Project and
   associated resources for setting up a single-account script that cleanses the resources across supplied regions
   via AWS-Nuke. It also creates the role for the nuke cleanser which is used for configuring the credentials
   for aws-nuke binary to cleanse resources within that account/region.
@@ -10,6 +10,9 @@ Parameters:
   BucketName:
     Description: The name of the bucket where the nuke binary and config files are stored
     Default: "nuke-account-cleanser-config"
+    Type: String
+  BudgetName:
+    Description: The name of the budget to be used for the overage.
     Type: String
   NukeCleanserRoleName:
     Description: The name of the Nuke Role to be assumed within each account, providing permissions to cleanse the account(s)
@@ -96,9 +99,9 @@ Resources:
       RoleName: !Ref NukeCleanserRoleName
       Description: Nuke Auto account cleanser role for Dev/Sandbox accounts
       MaxSessionDuration: 7200
-      Tags: 
+      Tags:
       - Key: privileged
-        Value: 'true' 
+        Value: 'true'
       - Key: description
         Value: 'PrivilegedReadWrite:auto-account-cleanser-role'
       - Key: owner
@@ -185,7 +188,7 @@ Resources:
                 Action: organizations:ListAccountsForParent
                 Resource: "*"
         -
-          PolicyName: S3BucketReadOnly 
+          PolicyName: S3BucketReadOnly
           PolicyDocument:
             Version: 2012-10-17
             Statement:
@@ -198,7 +201,7 @@ Resources:
                   - !Sub arn:aws:s3:::${NukeS3Bucket}
                   - !Sub arn:aws:s3:::${NukeS3Bucket}/*
         -
-          PolicyName: SNSPublishPolicy 
+          PolicyName: SNSPublishPolicy
           PolicyDocument:
             Version: 2012-10-17
             Statement:
@@ -274,6 +277,22 @@ Resources:
                 - export AWS_SDK_LOAD_CONFIG=1
                 - echo "Getting 12-digit ID of this account"
                 - account_id=$(aws sts get-caller-identity |jq -r ".Account");
+            pre_build:
+              on-failure: ABORT
+              commands:
+                - account_id=$(aws sts get-caller-identity | jq -r ".Account")
+                - budget_json=$(aws budgets describe-budget --account-id "$account_id" --budget-name "$BudgetName")
+                - actual_spend=$(echo "$budget_json" | jq -r '.Budget.CalculatedSpend.ActualSpend.Amount')
+                - budget_limit=$(echo "$budget_json" | jq -r '.Budget.BudgetLimit.Amount')
+                - |
+                  if (( $(echo "$actual_spend > $budget_limit" | bc -l) )); then
+                    echo "Budget is over the limit."
+                    exit 0
+                  else
+                    echo "Budget is within the limit."
+                    # Fail in order to stop the build
+                    exit 1
+                  fi
             build:
               on-failure: CONTINUE
               commands:
@@ -321,7 +340,7 @@ Resources:
                   {
                           echo "  Account Cleansing Process Failed;"
                           echo    ""
-                          
+
                           echo "  ----------------------------------------------------------------"
                           echo "  Summary of the process:"
                           echo "  ----------------------------------------------------------------"
@@ -338,8 +357,8 @@ Resources:
                           echo "  ################# Failed Nuke Process - Exiting ###################"
                           echo    ""
                   } >> fail_email_template.txt
-                - | 
-                  if [ "$CODEBUILD_BUILD_SUCCEEDING" = "0" ]; then 
+                - |
+                  if [ "$CODEBUILD_BUILD_SUCCEEDING" = "0" ]; then
                     echo " Couldn't process Nuke Cleanser - Exiting " >> fail_email_template.txt
                     cat error_log.txt >> fail_email_template.txt
                     aws sns publish --topic-arn $Publish_TopicArn --message file://fail_email_template.txt --subject "Nuke Account Cleanser Failed in account $account_id and region $NukeTargetRegion"
@@ -355,7 +374,7 @@ Resources:
                 - echo $LOG_EVENT_START_TIME
                 - echo $LOG_STREAM_NAME
                 - BLD_END_TIME=$(date -d @$(($LOG_EVENT_END_TIME/1000)))
-                - | 
+                - |
                   if [ -z "${LOG_STREAM_NAME}" ]; then
                     echo "Couldn't filter log events as params are null or empty";
                     exit 0;
@@ -379,7 +398,7 @@ Resources:
                   {
                           echo "  Account Cleansing Process Completed;"
                           echo    ""
-                          
+
                           echo "  ------------------------------------------------------------------"
                           echo "  Summary of the process:"
                           echo "  ------------------------------------------------------------------"
@@ -490,7 +509,7 @@ Resources:
     Properties:
       Bucket: !Ref NukeS3Bucket
       PolicyDocument:
-        Version: '2012-10-17' 
+        Version: '2012-10-17'
         Statement:
           - Sid: ForceSSLOnlyAccess
             Effect: Deny
